@@ -44,9 +44,7 @@ fn github_checksum_roundtrip_and_tamper() {
     let secret = "IqIMNOZH6zOwIEB4T9A2g4EHMy8Ji4";
     assert_eq!(mint::github_checksum(secret), "2q4HA5");
     assert!(mint::validate_github_token(&format!("ghp_{secret}2q4HA5")));
-    assert!(!mint::validate_github_token(&format!(
-        "ghp_{secret}3YCP9K"
-    )));
+    assert!(!mint::validate_github_token(&format!("ghp_{secret}3YCP9K")));
 }
 
 #[test]
