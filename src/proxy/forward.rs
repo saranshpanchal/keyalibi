@@ -7,11 +7,12 @@ use crate::policy::{host_allowed, ExfilAction};
 use crate::proxy::body::{blocked_response, full, text_response, ProxyBody};
 use crate::proxy::ca::SessionCa;
 use crate::proxy::scrub::StreamScrubber;
-use crate::proxy::sigv4::{self, looks_like_presign, looks_like_sigv4};
+use crate::proxy::sigv4::{self, looks_like_sigv4};
 use crate::proxy::ssrf::{self, Resolved};
 use crate::proxy::tripwire::{Pair, Rewriter};
 use crate::proxy::ProxyState;
 use crate::{Error, Result};
+use base64::Engine;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -92,10 +93,9 @@ async fn handle(req: Request<Incoming>, state: &ProxyState) -> Result<Response<P
         return Ok(blocked_response(&detail));
     }
 
-    let path = rewrite_string(&state.swap, &dest.path);
-    let mut query = rewrite_string(&state.swap, &dest.query);
-    let mut headers = rewrite_headers(&state.swap, &parts.headers);
-    let body_swapped = state.swap.rewrite(&body_bytes);
+    let path = dest.path.clone();
+    let query = dest.query.clone();
+    let (mut headers, swapped_ids) = rewrite_credential_headers(&parts.headers, &state.secrets);
     strip_hop_headers(&mut headers);
     headers.remove(http::header::ACCEPT_ENCODING);
     headers.remove(http::header::HOST);
@@ -111,27 +111,29 @@ async fn handle(req: Request<Incoming>, state: &ProxyState) -> Result<Response<P
     );
     headers.insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_swapped.len().to_string())
+        HeaderValue::from_str(&body_bytes.len().to_string())
             .map_err(|_| Error::new("invalid content length"))?,
     );
 
-    if let Some(secret) = aws_secret(&state.secrets, &hits) {
-        if let Err(err) = resign_aws(
-            parts.method.as_str(),
-            &path,
-            &mut query,
-            &mut headers,
-            &body_swapped,
-            secret,
-        ) {
-            return Ok(text_response(
-                StatusCode::NOT_IMPLEMENTED,
-                format!("KeyAlibi could not re-sign this AWS request: {err}\n"),
-            ));
+    if looks_like_sigv4(&headers) {
+        if let Some(secret) = aws_secret_in_authorization(&state.secrets, &headers) {
+            if let Err(err) = resign_aws(
+                parts.method.as_str(),
+                &path,
+                &query,
+                &mut headers,
+                &body_bytes,
+                secret,
+            ) {
+                return Ok(text_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    format!("KeyAlibi could not re-sign this AWS request: {err}\n"),
+                ));
+            }
         }
     }
 
-    for id in &hits {
+    for id in &swapped_ids {
         let secret = &state.secrets[*id];
         let _ = state.audit.record(NewEvent {
             kind: "swap",
@@ -140,7 +142,25 @@ async fn handle(req: Request<Incoming>, state: &ProxyState) -> Result<Response<P
             command: state.child_command.clone(),
             destination: dest.logical_host.clone(),
             env_var: secret.env_var.clone(),
-            detail: "phantom swapped for an allowlisted upstream".into(),
+            detail: "phantom swapped in a credential header".into(),
+        });
+    }
+    for id in outside_credential_hits(
+        &dest.path,
+        &dest.query,
+        &parts.headers,
+        &body_bytes,
+        &state.secrets,
+    ) {
+        let secret = &state.secrets[id];
+        let _ = state.audit.record(NewEvent {
+            kind: "retain",
+            severity: "warning",
+            child_pid: nonzero_pid(state),
+            command: state.child_command.clone(),
+            destination: dest.logical_host.clone(),
+            env_var: secret.env_var.clone(),
+            detail: "phantom left unsubstituted outside a credential header".into(),
         });
     }
 
@@ -166,11 +186,11 @@ async fn handle(req: Request<Incoming>, state: &ProxyState) -> Result<Response<P
         &path,
         &query,
         &headers,
-        Bytes::from(body_swapped),
+        body_bytes,
         &state.ca,
     )
     .await?;
-    finish_response(upstream, state, !hits.is_empty()).await
+    finish_response(upstream, state, !swapped_ids.is_empty()).await
 }
 
 fn route(
@@ -325,21 +345,22 @@ fn first_violation<'a>(
     })
 }
 
-fn aws_secret<'a>(secrets: &'a [SecretRecord], hits: &[usize]) -> Option<&'a SecretRecord> {
-    hits.iter().find_map(|id| {
-        let secret = secrets.get(*id)?;
-        if secret.provider == Provider::Aws && secret.real_aux_str().is_some() {
-            Some(secret)
-        } else {
-            None
-        }
+fn aws_secret_in_authorization<'a>(
+    secrets: &'a [SecretRecord],
+    headers: &HeaderMap,
+) -> Option<&'a SecretRecord> {
+    let auth = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+    secrets.iter().find(|secret| {
+        secret.provider == Provider::Aws
+            && secret.real_aux_str().is_some()
+            && auth.contains(secret.real_str())
     })
 }
 
 fn resign_aws(
     method: &str,
     path: &str,
-    query: &mut String,
+    query: &str,
     headers: &mut HeaderMap,
     body: &[u8],
     secret: &SecretRecord,
@@ -348,50 +369,128 @@ fn resign_aws(
     let real_secret = secret
         .real_aux_str()
         .ok_or_else(|| Error::new("AWS secret access key is not loaded"))?;
-    if looks_like_sigv4(headers) {
-        sigv4::resign_authorization(method, path, query, headers, body, real_access, real_secret)?;
-        return Ok(());
-    }
-    if looks_like_presign(query) {
-        *query = sigv4::resign_query(
-            method,
-            path,
-            query,
-            &host_from_headers(headers),
-            real_access,
-            real_secret,
-        )?;
-    }
-    Ok(())
+    // Presigned query strings are not a credential slot. Re-signing them would
+    // place the real access key in the URL, so only the Authorization header
+    // is re-signed.
+    sigv4::resign_authorization(method, path, query, headers, body, real_access, real_secret)
 }
 
-fn host_from_headers(headers: &HeaderMap) -> String {
-    headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost")
-        .to_string()
+fn header_is_slot(name: &str, secret: &SecretRecord) -> bool {
+    secret
+        .inject
+        .iter()
+        .any(|slot| slot.eq_ignore_ascii_case(name))
 }
 
-fn rewrite_string(rewriter: &Rewriter, value: &str) -> String {
-    match String::from_utf8(rewriter.rewrite(value.as_bytes())) {
-        Ok(text) => text,
-        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+fn pairs_for(id: usize, secret: &SecretRecord) -> Vec<Pair> {
+    let mut pairs = Vec::new();
+    pairs.push(Pair {
+        from: secret.phantom.clone(),
+        to: secret.real_str().to_string(),
+        id,
+    });
+    if let (Some(phantom), Some(real)) = (&secret.phantom_aux, secret.real_aux_str()) {
+        pairs.push(Pair {
+            from: phantom.clone(),
+            to: real.to_string(),
+            id,
+        });
     }
+    pairs
 }
 
-fn rewrite_headers(rewriter: &Rewriter, headers: &HeaderMap) -> HeaderMap {
+/// Replace phantoms only in headers named by each secret's inject list.
+/// Returns the secret indexes that were present in one of those headers.
+fn rewrite_credential_headers(
+    headers: &HeaderMap,
+    secrets: &[SecretRecord],
+) -> (HeaderMap, Vec<usize>) {
     let mut out = HeaderMap::new();
+    let mut swapped = Vec::new();
     for (name, value) in headers.iter() {
         if is_hop(name) {
             continue;
         }
-        let rewritten = rewriter.rewrite(value.as_bytes());
+        let applicable: Vec<Pair> = secrets
+            .iter()
+            .enumerate()
+            .filter(|(_, secret)| header_is_slot(name.as_str(), secret))
+            .flat_map(|(id, secret)| pairs_for(id, secret))
+            .collect();
+        let original = value.as_bytes();
+        let rewritten = if applicable.is_empty() {
+            original.to_vec()
+        } else if name.as_str().eq_ignore_ascii_case("authorization") {
+            rewrite_authorization(original, &applicable)
+        } else {
+            Rewriter::from_pairs(&applicable).rewrite(original)
+        };
+        if rewritten != original {
+            for pair in &applicable {
+                if swapped.iter().all(|id| *id != pair.id) {
+                    let finder = Rewriter::from_pairs(std::slice::from_ref(pair));
+                    if !finder.matching_ids(original).is_empty() {
+                        swapped.push(pair.id);
+                    }
+                }
+            }
+        }
         if let Ok(header) = HeaderValue::from_bytes(&rewritten) {
             out.append(name, header);
         }
     }
-    out
+    swapped.sort_unstable();
+    swapped.dedup();
+    (out, swapped)
+}
+
+fn rewrite_authorization(value: &[u8], pairs: &[Pair]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(value);
+    let trimmed = text.trim();
+    let basic = trimmed
+        .strip_prefix("Basic ")
+        .or_else(|| trimmed.strip_prefix("basic "));
+    if let Some(payload) = basic {
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(payload.trim()) {
+            let rewriter = Rewriter::from_pairs(pairs);
+            let replaced = rewriter.rewrite(&decoded);
+            if replaced != decoded {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(replaced);
+                return format!("Basic {encoded}").into_bytes();
+            }
+        }
+    }
+    Rewriter::from_pairs(pairs).rewrite(value)
+}
+
+fn outside_credential_hits(
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    secrets: &[SecretRecord],
+) -> Vec<usize> {
+    let mut found = Vec::new();
+    for (id, secret) in secrets.iter().enumerate() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(path.as_bytes());
+        blob.push(b'\n');
+        blob.extend_from_slice(query.as_bytes());
+        blob.push(b'\n');
+        blob.extend_from_slice(body);
+        for (name, value) in headers.iter() {
+            if header_is_slot(name.as_str(), secret) {
+                continue;
+            }
+            blob.push(b'\n');
+            blob.extend_from_slice(value.as_bytes());
+        }
+        let pairs = pairs_for(id, secret);
+        if !Rewriter::from_pairs(&pairs).matching_ids(&blob).is_empty() {
+            found.push(id);
+        }
+    }
+    found
 }
 
 fn strip_hop_headers(headers: &mut HeaderMap) {

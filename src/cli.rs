@@ -27,7 +27,7 @@ struct Cli {
 enum Commands {
     /// Inject phantom credentials and run a command behind the egress proxy.
     Run {
-        /// Policy file. Defaults to ./.keyalibi.toml, or auto-detection when that file is absent.
+        /// Policy file for this invocation. A repo .keyalibi.toml is used only after `keyalibi trust`.
         #[arg(long, value_name = "FILE")]
         policy: Option<PathBuf>,
         /// Command to execute. Put options for the command after `--`.
@@ -41,6 +41,11 @@ enum Commands {
         /// Overwrite an existing policy file.
         #[arg(long)]
         force: bool,
+    },
+    /// Approve the current .keyalibi.toml by recording its sha256.
+    Trust {
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Prove phantoms, upstream swap, and exfiltration blocking on localhost.
     Verify,
@@ -68,6 +73,13 @@ pub fn entry() -> Result<i32> {
                 "wrote {} (allowlists only; secret values were not stored)",
                 path.display()
             );
+            println!("review it, then run `keyalibi trust` before `keyalibi run` will use it");
+            Ok(0)
+        }
+        Commands::Trust { dir } => {
+            let dir = dir.unwrap_or(std::env::current_dir()?);
+            let (path, hash) = policy::trust_repo_policy(&dir)?;
+            println!("trusted {} sha256 {hash}", path.display());
             Ok(0)
         }
         Commands::Verify => Ok(crate::verify::run()?),
@@ -218,6 +230,7 @@ pub fn mint_records(
                 real: item.value,
                 real_aux: item.aux_value,
                 allowed_hosts: item.allowed_hosts,
+                inject: item.inject,
             },
         )?);
     }

@@ -16,6 +16,7 @@ fn mint(provider: Provider, env: &str, real: &str) -> keyalibi::mint::SecretReco
                 .iter()
                 .map(|h| (*h).to_string())
                 .collect(),
+            inject: Vec::new(),
         },
     )
     .unwrap()
@@ -40,18 +41,17 @@ fn github_checksum_roundtrip_and_tamper() {
     let tampered = String::from_utf8(chars).unwrap();
     assert!(!mint::validate_github_token(&tampered));
 
-    let body = format!("ghp_{}", "A".repeat(30));
-    assert_eq!(mint::github_checksum(&body), "1yBYBE");
-    assert!(mint::validate_github_token(&format!("{body}1yBYBE")));
+    let secret = "IqIMNOZH6zOwIEB4T9A2g4EHMy8Ji4";
+    assert_eq!(mint::github_checksum(secret), "2q4HA5");
+    assert!(mint::validate_github_token(&format!("ghp_{secret}2q4HA5")));
+    assert!(!mint::validate_github_token(&format!(
+        "ghp_{secret}3YCP9K"
+    )));
 }
 
 #[test]
 fn provider_shapes() {
-    let stripe = mint(
-        Provider::Stripe,
-        "STRIPE_API_KEY",
-        "sk_live_example",
-    );
+    let stripe = mint(Provider::Stripe, "STRIPE_API_KEY", "sk_live_example");
     assert!(
         mint::validate_phantom(Provider::Stripe, &stripe.phantom),
         "{}",
@@ -118,6 +118,7 @@ fn aws_access_key_and_secret_shape() {
                 "realSecret0123456789realSecret0123456789".to_string(),
             )),
             allowed_hosts: vec!["*.amazonaws.com".into()],
+            inject: Vec::new(),
         },
     )
     .unwrap();
@@ -144,6 +145,7 @@ fn same_session_is_deterministic() {
             real: SecretString::from("gho_real".to_string()),
             real_aux: None,
             allowed_hosts: vec!["api.github.com".into()],
+            inject: Vec::new(),
         },
     )
     .unwrap();

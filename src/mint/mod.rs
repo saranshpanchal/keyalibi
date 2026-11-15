@@ -94,6 +94,19 @@ impl Provider {
     }
 
     /// Environment variable a typical SDK reads as its base URL.
+    /// Header names where this provider's phantom may be replaced.
+    /// Bodies, query strings, and paths are never credential slots.
+    pub fn default_inject(self) -> Vec<String> {
+        match self {
+            Self::Openai => vec!["authorization".into(), "api-key".into()],
+            Self::Anthropic => vec!["x-api-key".into(), "authorization".into()],
+            Self::Stripe | Self::Github | Self::Slack => vec!["authorization".into()],
+            Self::Google => vec!["x-goog-api-key".into()],
+            Self::Aws => vec!["authorization".into()],
+            Self::Generic => vec!["authorization".into(), "x-api-key".into()],
+        }
+    }
+
     pub fn base_url_env(self) -> Option<&'static str> {
         match self {
             Self::Openai => Some("OPENAI_BASE_URL"),
@@ -117,6 +130,9 @@ pub struct MintInput {
     pub real: SecretString,
     pub real_aux: Option<SecretString>,
     pub allowed_hosts: Vec<String>,
+    /// Header names allowed to receive the real secret. Empty means the
+    /// provider default. Never includes bodies, query strings, or paths.
+    pub inject: Vec<String>,
 }
 
 /// Supervisor-side record. `real` is zeroized on drop and its bytes are mlocked.
@@ -129,6 +145,8 @@ pub struct SecretRecord {
     pub phantom_aux: Option<String>,
     pub real_aux: Option<SecretString>,
     pub allowed_hosts: Vec<String>,
+    /// Lowercase header names that may carry the real secret.
+    pub inject: Vec<String>,
     pub mint_time: SystemTime,
 }
 
@@ -196,6 +214,16 @@ pub fn mint(session: &Session, input: MintInput) -> crate::Result<SecretRecord> 
     }
     let (phantom, phantom_aux) = tokens::mint_value(session, &input);
     tokens::assert_minted(input.provider, &phantom)?;
+    let inject = if input.inject.is_empty() {
+        input.provider.default_inject()
+    } else {
+        input
+            .inject
+            .iter()
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect()
+    };
     if phantom == input.real.expose_secret() {
         return Err(Error::new(format!(
             "refusing to mint {}: phantom collided with the real secret",
@@ -211,6 +239,7 @@ pub fn mint(session: &Session, input: MintInput) -> crate::Result<SecretRecord> 
         phantom_aux,
         real_aux: input.real_aux,
         allowed_hosts: input.allowed_hosts,
+        inject,
         mint_time: SystemTime::now(),
     })
 }

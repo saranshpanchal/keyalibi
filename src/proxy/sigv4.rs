@@ -85,6 +85,11 @@ pub fn resign_authorization(
 
 /// Re-sign a query-string (presigned) URL. Returns the new query string,
 /// without a leading `?`.
+///
+/// The proxy does not call this on live traffic: a presigned URL is not a
+/// credential header, and rewriting it would put the real access key in the
+/// query string. The function stays so the algorithm can be tested.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resign_query(
     method: &str,
     path: &str,
@@ -155,6 +160,7 @@ pub fn looks_like_sigv4(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn looks_like_presign(query: &str) -> bool {
     query.contains("X-Amz-Signature=") || query.contains("X-Amz-Algorithm=")
 }
@@ -404,6 +410,7 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_pairs(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
@@ -412,6 +419,7 @@ fn encode_pairs(pairs: &[(String, String)]) -> String {
         .join("&")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn query_get(pairs: &[(String, String)], name: &str) -> Option<String> {
     pairs
         .iter()
@@ -419,6 +427,7 @@ fn query_get(pairs: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn query_set(pairs: &mut Vec<(String, String)>, name: &str, value: &str) {
     if let Some((_, slot)) = pairs.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
         *slot = value.to_string();
@@ -517,5 +526,22 @@ mod tests {
         assert!(!updated.contains(phantom_ak));
         assert!(!updated.contains("deadbeef"));
         assert!(updated.contains("Signature="));
+    }
+
+    #[test]
+    fn presign_helper_rewrites_the_access_key() {
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20150830%2Fus-east-1%2Fiam%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef";
+        assert!(looks_like_presign(query));
+        let out = resign_query(
+            "GET",
+            "/",
+            query,
+            "iam.amazonaws.com",
+            "AKIAREALACCESSKEY1",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        )
+        .unwrap();
+        assert!(out.contains("AKIAREALACCESSKEY1"));
+        assert!(!out.contains("deadbeef"));
     }
 }

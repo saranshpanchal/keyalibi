@@ -314,9 +314,18 @@ fn child_main(
     }
     if attempt_namespace {
         #[cfg(target_os = "linux")]
-        if let Err(err) = setup_mounts(plan) {
-            let _ = write_all(c2p_w, format!("F{err}\n").as_bytes());
-            return 112;
+        {
+            if let Err(err) = setup_mounts(plan) {
+                let _ = write_all(c2p_w, format!("F{err}\n").as_bytes());
+                return 112;
+            }
+            // Drop out of the root uid in this user namespace before exec.
+            // A nested user namespace locks the mounts (MNT_LOCKED) and maps
+            // us back to the original uid, so `umount` cannot reveal the host file.
+            if let Err(err) = lock_namespace() {
+                let _ = write_all(c2p_w, format!("F{err}\n").as_bytes());
+                return 112;
+            }
         }
     }
     let _ = write_all(c2p_w, b"R\n");
@@ -407,6 +416,134 @@ fn setup_mounts(plan: &JailPlan) -> std::io::Result<()> {
         .map_err(|err| std::io::Error::other(err.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn lock_namespace() -> std::io::Result<()> {
+    let host_uid = outside_id("/proc/self/uid_map")?;
+    let host_gid = outside_id("/proc/self/gid_map")?;
+    let (note_r, note_w) = pipe()?;
+    let (ack_r, ack_w) = pipe()?;
+    let helper = unsafe { libc::fork() };
+    if helper < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if helper == 0 {
+        close_fd(Some(note_w));
+        close_fd(Some(ack_r));
+        let _ = read_line(note_r);
+        let ppid = unsafe { libc::getppid() };
+        let wrote = (|| -> std::io::Result<()> {
+            std::fs::write(format!("/proc/{ppid}/setgroups"), "deny")?;
+            std::fs::write(format!("/proc/{ppid}/uid_map"), format!("{host_uid} 0 1\n"))?;
+            std::fs::write(format!("/proc/{ppid}/gid_map"), format!("{host_gid} 0 1\n"))?;
+            Ok(())
+        })();
+        let message = match wrote {
+            Ok(()) => "K\n".to_string(),
+            Err(err) => format!("E{err}\n"),
+        };
+        let _ = write_all(ack_w, message.as_bytes());
+        unsafe { libc::_exit(0) };
+    }
+    close_fd(Some(note_r));
+    close_fd(Some(ack_w));
+    let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = write_all(note_w, b"X\n");
+        close_fd(Some(note_w));
+        close_fd(Some(ack_r));
+        let _ = wait_pid_raw(helper);
+        return Err(err);
+    }
+    let _ = write_all(note_w, b"U\n");
+    close_fd(Some(note_w));
+    let ack = read_line(ack_r).unwrap_or_default();
+    close_fd(Some(ack_r));
+    let _ = wait_pid_raw(helper);
+    if !ack.starts_with('K') {
+        return Err(std::io::Error::other(if ack.is_empty() {
+            "nested uid map was not written".to_string()
+        } else {
+            ack
+        }));
+    }
+    drop_privileges()
+}
+
+#[cfg(target_os = "linux")]
+fn outside_id(path: &str) -> std::io::Result<u32> {
+    let text = std::fs::read_to_string(path)?;
+    let mut parts = text.split_whitespace();
+    let _inside = parts.next();
+    let outside = parts
+        .next()
+        .ok_or_else(|| std::io::Error::other(format!("empty {path}")))?;
+    outside
+        .parse()
+        .map_err(|_| std::io::Error::other(format!("bad id in {path}")))
+}
+
+#[cfg(target_os = "linux")]
+fn drop_privileges() -> std::io::Result<()> {
+    let no_new = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if no_new != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // PR_CAP_AMBIENT = 47, PR_CAP_AMBIENT_CLEAR_ALL = 4.
+    unsafe { libc::prctl(47, 4, 0, 0, 0) };
+    for cap in 0..64 {
+        unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+    }
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut data = [
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_mut_ptr()) };
+    if rc != 0 && unsafe { libc::geteuid() } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_pid_raw(pid: i32) -> std::io::Result<()> {
+    let mut status = 0;
+    loop {
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(());
+    }
 }
 
 #[cfg(target_os = "linux")]

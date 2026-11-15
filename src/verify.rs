@@ -89,6 +89,7 @@ fn prove() -> Result<Vec<Check>> {
             provider: Provider::Openai,
             allowed_hosts: vec!["api.openai.com".into()],
             paired_env: None,
+            inject: Vec::new(),
         }],
         ..Policy::default()
     };
@@ -246,15 +247,28 @@ fn network_checks(
             .lock()
             .map_err(|_| Error::new("mock lock poisoned"))?
             .clone();
+        let auth_swapped = recorded.iter().any(|hit| {
+            let mut lines = hit.splitn(3, '\n');
+            let _path = lines.next();
+            let auth = lines.next().unwrap_or("");
+            auth.contains(&real) && !auth.contains(&phantom)
+        });
+        let body_kept = recorded.iter().any(|hit| {
+            let mut lines = hit.splitn(3, '\n');
+            let _path = lines.next();
+            let _auth = lines.next();
+            let body = lines.next().unwrap_or("");
+            body.contains(&phantom) && !body.contains(&real)
+        });
         if status.is_success()
-            && recorded.iter().any(|hit| hit.contains(&real))
-            && !recorded.iter().any(|hit| hit.contains(&phantom))
+            && auth_swapped
+            && body_kept
             && text.contains(&phantom)
             && !text.contains(&real)
         {
             checks.push(pass(
                 "upstream swap",
-                "allowlisted mock saw the real secret and the client saw the phantom",
+                "credential header was swapped; the body kept the phantom; the client saw no real secret",
             ));
         } else {
             checks.push(fail(
@@ -454,6 +468,7 @@ fn load_from_file(
                 aux_env: spec.paired_env.clone(),
                 aux_value: None,
                 allowed_hosts: spec.allowed_hosts.clone(),
+                inject: spec.inject.clone(),
             });
         }
     }
@@ -475,11 +490,7 @@ fn format_checks(session: &Session) -> Result<Vec<Check>> {
             "GITHUB_TOKEN",
             "ghp_realsecretvalueplaceholder1",
         ),
-        (
-            Provider::Stripe,
-            "STRIPE_API_KEY",
-            "sk_live_example",
-        ),
+        (Provider::Stripe, "STRIPE_API_KEY", "sk_live_example"),
         (
             Provider::Anthropic,
             "ANTHROPIC_API_KEY",
@@ -507,6 +518,7 @@ fn format_checks(session: &Session) -> Result<Vec<Check>> {
                     .iter()
                     .map(|h| (*h).to_string())
                     .collect(),
+                inject: Vec::new(),
             },
         )?;
         if mint::validate_phantom(provider, &record.phantom) && record.phantom != real {
@@ -529,6 +541,7 @@ fn format_checks(session: &Session) -> Result<Vec<Check>> {
                 "realAwsSecretValue0123456789abcdefghij".to_string(),
             )),
             allowed_hosts: vec!["*.amazonaws.com".into()],
+            inject: Vec::new(),
         },
     )?;
     let access_ok = mint::validate_phantom(Provider::Aws, &aws.phantom);

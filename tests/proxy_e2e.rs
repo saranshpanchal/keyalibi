@@ -40,13 +40,43 @@ async fn swaps_on_allowlisted_host_and_scrubs_the_response() {
     assert!(body.contains(&phantom), "{body}");
     assert!(!body.contains(REAL), "{body}");
     let recorded = seen.lock().unwrap().clone();
+    let hit = recorded.last().expect("mock saw a request");
+    let mut lines = hit.splitn(3, '\n');
+    let auth = lines.next().unwrap_or("");
+    let extra = lines.next().unwrap_or("");
+    let req_body = lines.next().unwrap_or("");
+    assert!(auth.contains(REAL) && !auth.contains(&phantom), "{auth}");
+    assert!(extra.contains(&phantom) && !extra.contains(REAL), "{extra}");
     assert!(
-        recorded.iter().any(|hit| hit.contains(REAL)),
-        "{recorded:?}"
+        req_body.contains(&phantom) && !req_body.contains(REAL),
+        "{req_body}"
     );
+    let _ = std::fs::remove_file(&audit_path);
+}
+
+#[tokio::test]
+async fn phantom_in_body_is_not_swapped_on_an_allowed_host() {
+    let (phantom, proxy, seen, audit_path) = harness().await;
+    let response = exchange(
+        proxy.addr,
+        "POST",
+        "/upstream/openai/v1/chat",
+        &[],
+        format!("gist body {phantom}"),
+    )
+    .await;
+    assert!(response.status.is_success(), "{}", response.status);
+    assert!(!response.body.contains(REAL), "{}", response.body);
+    assert!(response.body.contains(&phantom), "{}", response.body);
+    let recorded = seen.lock().unwrap().clone();
+    let hit = recorded.last().expect("mock saw a request");
+    assert!(hit.contains(&phantom), "{hit}");
+    assert!(!hit.contains(REAL), "{hit}");
+    let log = AuditLog::open(&audit_path).unwrap();
+    let events = log.recent(20).unwrap();
     assert!(
-        recorded.iter().all(|hit| !hit.contains(&phantom)),
-        "{recorded:?}"
+        events.iter().any(|event| event.kind == "retain"),
+        "{events:?}"
     );
     let _ = std::fs::remove_file(&audit_path);
 }
@@ -150,6 +180,7 @@ async fn harness() -> (
             real: SecretString::from(REAL.to_string()),
             real_aux: None,
             allowed_hosts: vec!["api.openai.com".into()],
+            inject: Vec::new(),
         },
     )
     .unwrap();

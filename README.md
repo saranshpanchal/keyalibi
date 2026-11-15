@@ -34,6 +34,9 @@ releases pull an HTTP/3 graph that does not build on Rust 1.83.
 # Secret values are not written into the policy.
 keyalibi init
 
+# Review the file, then pin its hash before run will load it.
+keyalibi trust
+
 # Run an agent or a test suite. Put the child command after `--`.
 keyalibi run -- claude
 keyalibi run --policy .keyalibi.toml -- pytest
@@ -45,6 +48,13 @@ keyalibi verify
 keyalibi audit
 keyalibi tui
 ```
+
+A repo `.keyalibi.toml` is not trusted just because it sits in the working
+tree. `keyalibi run` applies it only after `keyalibi trust` records its sha256
+under `~/.config/keyalibi/pins.toml` (or `$XDG_CONFIG_HOME/keyalibi`). Editing
+the file invalidates the pin. `keyalibi run --policy FILE` trusts that path
+for one invocation. TLD-wide wildcards such as `*.com` are rejected, and the
+proxy listen address is forced to loopback.
 
 `keyalibi run` reads secret values from the process environment and from the
 env files named in the policy (`.env`, `.env.local`, `.env.production`, …).
@@ -118,7 +128,7 @@ shape each SDK checks offline:
 
 | Provider | Shape |
 | --- | --- |
-| GitHub `ghp_` `gho_` `ghu_` `ghs_` `ghr_` | prefix + 30 Base62 + 6-char Base62 CRC32 (IEEE, `crc32fast`) |
+| GitHub `ghp_` `gho_` `ghu_` `ghs_` `ghr_` | prefix + 30 Base62 + 6-char Base62 CRC32 of those 30 characters only (not the prefix) |
 | AWS | `AKIA`/`ASIA` + 16 chars from `A-Z2-7`, plus a 40-character phantom secret. The proxy re-signs `AWS4-HMAC-SHA256` because the real secret never travels. |
 | Stripe | `sk_live_` / `sk_test_` / `rk_live_` / `rk_test_` + Base62 with a `KEYALIBI` marker |
 | Anthropic | `sk-ant-api03-` + 93 `[A-Za-z0-9_-]` + `AA` |
@@ -156,7 +166,11 @@ package managers keep working.
 bytes, plus standard and URL-safe base64 of the phantom, including decoded
 blobs) are scanned with `aho-corasick`.
 
-- Allowlisted host: swap phantom to real, or re-sign SigV4.
+- Allowlisted host: swap the phantom only in that secret's credential
+  headers (`Authorization`, `x-api-key`, `api-key`, `x-goog-api-key`, or the
+  `inject` list in the policy). A phantom in a body, query string, or path
+  stays a phantom and is logged as `retain`. SigV4 is re-signed only from the
+  `Authorization` header.
 - Any other host: `451` with body `Exfiltration Blocked by KeyAlibi`, a
   critical audit row (child pid, command, destination, env var name), and the
   optional stop/kill action. The real secret is not forwarded.
@@ -175,9 +189,11 @@ address.
 ### Filesystem jail
 
 On Linux the child `unshare`s `CLONE_NEWUSER|CLONE_NEWNS`, makes `/` private,
-and bind-mounts tmpfs-backed phantom files over the workspace env files. `cat
-.env` inside the child returns phantoms. A process outside the namespace still
-sees the original bytes.
+and bind-mounts tmpfs-backed phantom files over the workspace env files. Before
+`exec` it enters a nested user namespace so those mounts are locked, maps back
+to the original uid/gid, and sets `PR_SET_NO_NEW_PRIVS` with an empty
+capability set. `umount .env` inside the child fails. `cat .env` returns
+phantoms. A process outside the namespace still sees the original bytes.
 
 ### Audit log and TUI
 
@@ -273,6 +289,17 @@ These are hard limits of the approach, not temporary omissions.
   blobs, not with a structured MIME parser. A token split by a custom
   encoding other than base64 can be missed. Contiguous occurrences are
   swapped or blocked.
+
+## Known follow-ups
+
+These are real gaps and are not fixed in this change:
+
+- Credentials freshly issued by STS or OAuth (session tokens the proxy did not mint) are not scrubbed from responses.
+- Topology B still tunnels HTTPS to hosts that are not on an allowlist, so a phantom inside that ciphertext is not inspected.
+- Provider base-URL variables are overwritten for the child even when that provider is not in use.
+- The audit log and CA bundle are written under `./.keyalibi/` in the workspace.
+- The proxy does not authenticate its clients; any local process can connect.
+- If the namespace jail cannot be created, KeyAlibi fails open into env + proxy mode.
 
 ## Development
 

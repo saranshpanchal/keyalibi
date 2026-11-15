@@ -149,6 +149,9 @@ pub struct SecretSpec {
     pub allowed_hosts: Vec<String>,
     #[serde(default)]
     pub paired_env: Option<String>,
+    /// Header names that may receive the real secret. Empty uses the provider default.
+    #[serde(default)]
+    pub inject: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -274,17 +277,125 @@ pub struct LoadedSecret {
     pub aux_env: Option<String>,
     pub aux_value: Option<SecretString>,
     pub allowed_hosts: Vec<String>,
+    pub inject: Vec<String>,
 }
 
 pub fn load_policy(explicit: Option<&Path>, workspace: &Path) -> Result<Policy> {
+    load_policy_from(explicit, workspace, &user_config_dir())
+}
+
+/// Load a policy. A `--policy` path is explicit for this invocation. A repo
+/// `.keyalibi.toml` is applied only when `config_dir/pins.toml` records its
+/// current sha256. Anything else in the repo is ignored and, if the file
+/// exists, rejected so a cloned allowlist cannot widen itself.
+pub fn load_policy_from(
+    explicit: Option<&Path>,
+    workspace: &Path,
+    config_dir: &Path,
+) -> Result<Policy> {
     if let Some(path) = explicit {
         return read_policy(path);
     }
-    let discovered = workspace.join(POLICY_FILENAME);
-    if discovered.is_file() {
-        return read_policy(&discovered);
+    let repo = workspace.join(POLICY_FILENAME);
+    if repo.is_file() {
+        let canon = repo.canonicalize().unwrap_or(repo);
+        let hash = sha256_file(&canon)?;
+        if !pin_matches(config_dir, &canon, &hash)? {
+            return Err(Error::new(format!(
+                "{} is not trusted (sha256 {hash}). Repo policies are not applied until you review the file and run `keyalibi trust`.",
+                canon.display()
+            )));
+        }
+        return read_policy(&canon);
+    }
+    let user_policy = config_dir.join("config.toml");
+    if user_policy.is_file() {
+        return read_policy(&user_policy);
     }
     Ok(discover_policy(workspace))
+}
+
+pub fn user_config_dir() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("keyalibi");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config").join("keyalibi")
+}
+
+pub fn trust_repo_policy(workspace: &Path) -> Result<(PathBuf, String)> {
+    trust_repo_policy_in(workspace, &user_config_dir())
+}
+
+pub fn trust_repo_policy_in(workspace: &Path, config_dir: &Path) -> Result<(PathBuf, String)> {
+    let policy_path = workspace.join(POLICY_FILENAME);
+    if !policy_path.is_file() {
+        return Err(Error::new(format!("no {} to trust", policy_path.display())));
+    }
+    let canon = policy_path.canonicalize()?;
+    let hash = sha256_file(&canon)?;
+    // Validate before pinning so a bad allowlist cannot be approved by accident.
+    let _ = read_policy(&canon)?;
+    let mut pins = read_pins(config_dir)?;
+    let key = canon.display().to_string();
+    if let Some(existing) = pins.pins.iter_mut().find(|pin| pin.path == key) {
+        existing.sha256 = hash.clone();
+    } else {
+        pins.pins.push(PolicyPin {
+            path: key,
+            sha256: hash.clone(),
+        });
+    }
+    write_pins(config_dir, &pins)?;
+    Ok((canon, hash))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(path)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PinFile {
+    #[serde(default)]
+    pins: Vec<PolicyPin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PolicyPin {
+    path: String,
+    sha256: String,
+}
+
+fn read_pins(config_dir: &Path) -> Result<PinFile> {
+    let path = config_dir.join("pins.toml");
+    if !path.is_file() {
+        return Ok(PinFile::default());
+    }
+    let text = fs::read_to_string(&path)?;
+    Ok(toml::from_str(&text)?)
+}
+
+fn write_pins(config_dir: &Path, pins: &PinFile) -> Result<()> {
+    fs::create_dir_all(config_dir)?;
+    let body = toml::to_string_pretty(pins)?;
+    fs::write(
+        config_dir.join("pins.toml"),
+        format!("# Approved repo policies. Re-run `keyalibi trust` after any edit.\n\n{body}"),
+    )?;
+    Ok(())
+}
+
+fn pin_matches(config_dir: &Path, policy_path: &Path, hash: &str) -> Result<bool> {
+    let pins = read_pins(config_dir)?;
+    let key = policy_path.display().to_string();
+    Ok(pins
+        .pins
+        .iter()
+        .any(|pin| pin.path == key && pin.sha256 == hash))
 }
 
 pub fn read_policy(path: &Path) -> Result<Policy> {
@@ -310,10 +421,91 @@ pub fn read_policy(path: &Path) -> Result<Policy> {
         if spec.paired_env.is_none() {
             spec.paired_env = mint::paired_env_for(&spec.env, spec.provider).map(str::to_string);
         }
+        if spec.inject.is_empty() {
+            spec.inject = spec.provider.default_inject();
+        } else {
+            spec.inject = spec
+                .inject
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect();
+        }
+        for host in &spec.allowed_hosts {
+            check_host_pattern(host)?;
+        }
     }
-    // Validate CIDRs early.
+    policy.proxy.listen = force_loopback_listen(&policy.proxy.listen);
     let _ = policy.cidrs()?;
     Ok(policy)
+}
+
+/// Reject `*`, `*.com`, and any wildcard that is not a single leading `*.`
+/// over a name that already contains a dot.
+pub fn check_host_pattern(pattern: &str) -> Result<()> {
+    let trimmed = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed == "*" {
+        return Err(Error::new(format!(
+            "refusing host pattern `{pattern}`: a bare wildcard is not allowed"
+        )));
+    }
+    if let Some(suffix) = trimmed.strip_prefix("*.") {
+        if suffix.is_empty() || suffix.contains('*') || !suffix.contains('.') {
+            return Err(Error::new(format!(
+                "refusing host pattern `{pattern}`: wildcards must be a single leading `*.` and cannot cover a whole TLD"
+            )));
+        }
+        return Ok(());
+    }
+    if trimmed.contains('*') {
+        return Err(Error::new(format!(
+            "refusing host pattern `{pattern}`: only a leading `*.` wildcard is accepted"
+        )));
+    }
+    Ok(())
+}
+
+/// Bind addresses are always loopback. A policy that asks for `0.0.0.0` or a
+/// public address is rewritten to `127.0.0.1`, keeping the port.
+pub fn force_loopback_listen(listen: &str) -> String {
+    let listen = listen.trim();
+    if listen.is_empty() {
+        return "127.0.0.1:0".to_string();
+    }
+    if let Some(rest) = listen.strip_prefix('[') {
+        if let Some((host, port)) = rest.split_once("]:") {
+            if is_loopback_name(host) && port.chars().all(|c| c.is_ascii_digit()) {
+                return listen.to_string();
+            }
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                eprintln!(
+                    "keyalibi: listen address {listen} is not loopback; using 127.0.0.1:{port}"
+                );
+                return format!("127.0.0.1:{port}");
+            }
+        }
+    }
+    if let Some((host, port)) = listen.rsplit_once(':') {
+        if port.chars().all(|c| c.is_ascii_digit()) {
+            if is_loopback_name(host) {
+                return format!("{host}:{port}");
+            }
+            eprintln!("keyalibi: listen address {listen} is not loopback; using 127.0.0.1:{port}");
+            return format!("127.0.0.1:{port}");
+        }
+    }
+    if is_loopback_name(listen) {
+        return format!("{listen}:0");
+    }
+    eprintln!("keyalibi: listen address {listen} is not loopback; using 127.0.0.1:0");
+    "127.0.0.1:0".to_string()
+}
+
+fn is_loopback_name(host: &str) -> bool {
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 pub fn discover_policy(workspace: &Path) -> Policy {
@@ -391,6 +583,7 @@ fn detect_specs(workspace: &Path) -> Vec<SecretSpec> {
             provider,
             allowed_hosts: hosts,
             paired_env: mint::paired_env_for(key, provider).map(str::to_string),
+            inject: provider.default_inject(),
         });
     }
     specs
@@ -457,6 +650,11 @@ pub fn load_secrets(policy: &Policy, workspace: &Path) -> Result<Vec<LoadedSecre
             aux_env,
             aux_value,
             allowed_hosts: hosts,
+            inject: if spec.inject.is_empty() {
+                spec.provider.default_inject()
+            } else {
+                spec.inject.clone()
+            },
         });
     }
     Ok(loaded)
@@ -577,5 +775,100 @@ export OTHER=keep\n";
         assert!(out.contains("export OTHER=keep\n"));
         assert!(out.contains("# comment\n"));
         assert!(!out.contains("sk-real"));
+    }
+
+    #[test]
+    fn tld_wildcards_are_rejected_and_listen_is_loopback() {
+        assert!(check_host_pattern("*.com").is_err());
+        assert!(check_host_pattern("*").is_err());
+        assert!(check_host_pattern("*.io").is_err());
+        assert!(check_host_pattern("*.amazonaws.com").is_ok());
+        assert!(check_host_pattern("api.openai.com").is_ok());
+        assert_eq!(force_loopback_listen("0.0.0.0:9"), "127.0.0.1:9");
+        assert_eq!(force_loopback_listen("127.0.0.1:0"), "127.0.0.1:0");
+        assert_eq!(force_loopback_listen("[::]:8080"), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn repo_policy_requires_a_matching_pin() {
+        let root = std::env::temp_dir().join(format!(
+            "keyalibi-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("ws");
+        let config = root.join("cfg");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let policy_text = "\
+on_exfiltration = \"none\"
+[proxy]
+listen = \"0.0.0.0:9\"
+[[secrets]]
+env = \"OPENAI_API_KEY\"
+provider = \"openai\"
+allowed_hosts = [\"api.openai.com\"]
+";
+        std::fs::write(workspace.join(".keyalibi.toml"), policy_text).unwrap();
+        let untrusted = load_policy_from(None, &workspace, &config);
+        assert!(untrusted.is_err(), "{untrusted:?}");
+
+        let (path, hash) = trust_repo_policy_in(&workspace, &config).unwrap();
+        assert_eq!(
+            path,
+            workspace.join(".keyalibi.toml").canonicalize().unwrap()
+        );
+        let loaded = load_policy_from(None, &workspace, &config).unwrap();
+        assert_eq!(loaded.proxy.listen, "127.0.0.1:9");
+        assert_eq!(loaded.secrets[0].allowed_hosts, vec!["api.openai.com"]);
+        assert!(loaded.secrets[0]
+            .inject
+            .iter()
+            .any(|name| name == "authorization"));
+
+        std::fs::write(
+            workspace.join(".keyalibi.toml"),
+            policy_text.replace("api.openai.com", "api.openai.com\n"),
+        )
+        .unwrap();
+        // A trailing newline changes the hash only if we actually changed bytes.
+        std::fs::write(
+            workspace.join(".keyalibi.toml"),
+            format!("{policy_text}\n# edited\n"),
+        )
+        .unwrap();
+        assert!(load_policy_from(None, &workspace, &config).is_err());
+        let pins = std::fs::read_to_string(config.join("pins.toml")).unwrap();
+        assert!(pins.contains(&hash));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pinned_policy_still_rejects_tld_wildcards() {
+        let root = std::env::temp_dir().join(format!(
+            "keyalibi-tld-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = root.join("ws");
+        let config = root.join("cfg");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join(".keyalibi.toml"),
+            "[[secrets]]\nenv = \"OPENAI_API_KEY\"\nprovider = \"openai\"\nallowed_hosts = [\"*.com\"]\n",
+        )
+        .unwrap();
+        let err = trust_repo_policy_in(&workspace, &config).unwrap_err();
+        assert!(
+            err.to_string().contains("TLD") || err.to_string().contains("wildcard"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

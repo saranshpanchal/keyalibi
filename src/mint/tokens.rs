@@ -66,9 +66,9 @@ fn take(session: &Session, label: &str, n: usize, alphabet: &[u8]) -> String {
 fn mint_github(session: &Session, label: &str, real: &str) -> String {
     let prefix = github_prefix_of(real).unwrap_or("ghp_");
     let body_rand = take(session, label, 30, BASE62);
-    let body = format!("{prefix}{body_rand}");
-    let sum = github_checksum(&body);
-    format!("{body}{sum}")
+    // GitHub's CRC32 covers only the 30-character random part, not the prefix.
+    let sum = github_checksum(&body_rand);
+    format!("{prefix}{body_rand}{sum}")
 }
 
 fn mint_aws_access_key(session: &Session, label: &str, prefix: &str) -> String {
