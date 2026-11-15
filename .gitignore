@@ -1,0 +1,6 @@
+/target
+.keyalibi/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

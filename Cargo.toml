@@ -1,0 +1,75 @@
+[package]
+name = "keyalibi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "Local-first phantom-secret injector and outbound network-boundary firewall"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["secrets", "proxy", "credentials", "sandbox"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "keyalibi"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = ">=1.43, <1.54", features = ["full"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = ">=0.1.10, <0.1.21", features = ["tokio", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
+http = "1"
+rcgen = ">=0.13, <0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pki-types = "1"
+aho-corasick = "1"
+nix = { version = ">=0.29, <0.30", features = ["mount", "sched", "process", "signal", "fs"] }
+libc = "0.2"
+zeroize = { version = ">=1.8, <1.9", features = ["derive"] }
+secrecy = "0.10"
+crc32fast = "1"
+hmac = ">=0.12, <0.13"
+sha2 = ">=0.10, <0.11"
+rand = ">=0.8, <0.9"
+base64 = ">=0.22, <0.23"
+regex = "1"
+clap = { version = ">=4.5, <4.6", features = ["derive"] }
+dotenvy = "0.15"
+toml = ">=0.8, <0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = ">=0.32.1, <0.33", features = ["bundled"] }
+ratatui = ">=0.29, <0.30"
+crossterm = "0.28"
+thiserror = ">=2, <3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+webpki-roots = "0.26"
+flate2 = "1"
+url = "2"
+# Transitive pins: keep the graph on Rust 1.83 (no edition 2024 crates).
+zeroize_derive = "=1.4.3"
+time = "=0.3.44"
+deranged = "=0.5.5"
+instability = "=0.3.10"
+unicode-segmentation = "=1.12.0"
+clap_lex = "=1.0.1"
+jobserver = "=0.1.34"
+indexmap = "=2.12.1"
+idna_adapter = "=1.2.0"
+
+[dev-dependencies]
+base64 = ">=0.22, <0.23"
+tokio = { version = ">=1.43, <1.54", features = ["full"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = ">=0.1.10, <0.1.21", features = ["tokio", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+secrecy = "0.10"
+
+[profile.release]
+lto = false
+codegen-units = 16
